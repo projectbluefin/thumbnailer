@@ -1,0 +1,254 @@
+Bootstrap: oci-archive
+From: {{ OCI_ARCHIVE }}
+
+%files
+    usr/libexec/ffmpeg-thumbnailer/ffmpeg-video-thumbnailer-shim /opt/ffmpeg-thumbnailer/ffmpeg-video-thumbnailer-shim
+    usr/libexec/ffmpeg-thumbnailer/ffmpeg-thumbnailer-verify     /opt/ffmpeg-thumbnailer/ffmpeg-thumbnailer-verify
+    usr/share/thumbnailers/ffmpeg-thumbnailer.thumbnailer        /opt/ffmpeg-thumbnailer/ffmpeg-thumbnailer.thumbnailer
+    usr/lib/systemd/user/ffmpeg-thumbnailer.service              /opt/ffmpeg-thumbnailer/ffmpeg-thumbnailer.service
+    fix-failed-thumbnails.py                                     /opt/ffmpeg-thumbnailer/fix-failed-thumbnails.py
+    verify.sh                                                    /opt/ffmpeg-thumbnailer/verify.sh
+%labels
+
+    org.opencontainers.image.title       ffmpeg-thumbnailer
+    org.opencontainers.image.description Drop-in video thumbnailer daemon for GNOME on immutable Linux
+    io.ffmpeg-thumbnailer.variant        {{ VARIANT }}
+
+%environment
+    export LC_ALL=C.UTF-8
+
+%help
+    ffmpeg-thumbnailer -- a self-contained video thumbnailer for GNOME on bootc /
+    immutable systems, plus a general-purpose ffmpeg for encode work.
+
+    Default (no app)            run the thumbnailer daemon in the foreground
+    --app install               install the shim, thumbnailer entry and user service
+    --app uninstall             remove everything install placed
+    --app verify                end-to-end check, including GNOME's real sandbox shape
+    --app thumbnail  IN OUT     make one thumbnail without the daemon
+    --app fix                   regenerate thumbnails GNOME recorded as failed
+    --app encode     ...        hardware-accelerated encode helper
+    --app ffmpeg     ...        raw ffmpeg, all codecs and hwaccels available
+    --app probe                 report detected GPUs, VA-API drivers and hwaccels
+
+    The shim must live under /usr because GNOME's thumbnail sandbox binds only /usr.
+    On an ostree/bootc host /usr is read-only, so `--app install` will tell you to run
+    `sudo bootc usr-overlay` first (transient) or layer the shim into your image.
+
+%runscript
+    exec /usr/libexec/ffmpeg-thumbnailer/thumbnailer-server.py "$@"
+
+# ---------------------------------------------------------------- probe
+
+%apphelp probe
+    Report what hardware the container can actually reach.
+
+%apprun probe
+    echo "== render nodes"
+    for d in /dev/dri/renderD*; do
+        [ -e "$d" ] || { echo "  none"; break; }
+        printf '  %s: ' "$d"
+        vainfo --display drm --device "$d" 2>/dev/null \
+            | sed -n 's/^vainfo: Driver version: //p' | head -1
+        [ "${PIPESTATUS:-0}" = 0 ] || echo "no VA-API"
+    done
+    echo "== nvidia"
+    if [ -e /dev/nvidiactl ] || [ -e /dev/nvidia0 ]; then
+        echo "  device present; NVENC/NVDEC need 'apptainer run --nv'"
+        ls /usr/lib/x86_64-linux-gnu/libnvcuvid.so* >/dev/null 2>&1 \
+            && echo "  host driver libraries injected" \
+            || echo "  host driver libraries NOT injected (missing --nv)"
+    else
+        echo "  no NVIDIA device"
+    fi
+    echo "== ffmpeg hwaccels"
+    ffmpeg -hide_banner -hwaccels 2>/dev/null | tail -n +2 | sed 's/^/  /'
+    echo "== hardware encoders"
+    ffmpeg -hide_banner -encoders 2>/dev/null \
+        | sed -n 's/^ V[^ ]* \(\S*\(vaapi\|nvenc\|qsv\)\).*/  \1/p'
+
+# ---------------------------------------------------------------- install
+
+%apphelp install
+    Install the host shim, the GNOME thumbnailer entry and the user service.
+
+%apprun install
+    set -eu
+    PREFIX="${FFT_PREFIX:-/usr/libexec/ffmpeg-thumbnailer}"
+    SIF="${APPTAINER_CONTAINER:-${SINGULARITY_CONTAINER:-}}"
+    SRC=/opt/ffmpeg-thumbnailer
+
+    if [ -z "$SIF" ]; then
+        echo "install: cannot determine my own image path" >&2
+        exit 1
+    fi
+
+    # The shim has to sit under /usr: GNOME's thumbnail sandbox binds /usr and nothing
+    # else that we can reach. On ostree hosts /usr is read-only.
+    if ! install -d "$PREFIX" 2>/dev/null; then
+        echo "install: $PREFIX is not writable." >&2
+        if command -v bootc >/dev/null 2>&1; then
+            echo "  This looks like a bootc host. For a transient install run:" >&2
+            echo "    sudo bootc usr-overlay" >&2
+            echo "  then re-run this app. To make it permanent, copy the shim into" >&2
+            echo "  your bootc image at $PREFIX instead." >&2
+        fi
+        exit 1
+    fi
+
+    install -m 0755 "$SRC/ffmpeg-video-thumbnailer-shim" "$PREFIX/ffmpeg-video-thumbnailer-shim"
+    echo "installed $PREFIX/ffmpeg-video-thumbnailer-shim"
+    install -m 0755 "$SRC/ffmpeg-thumbnailer-verify" "$PREFIX/ffmpeg-thumbnailer-verify"
+    echo "installed $PREFIX/ffmpeg-thumbnailer-verify"
+
+    # The .thumbnailer entry and the unit are read outside the sandbox, so they can
+    # live in the user's home and need no elevated rights.
+    THUMBDIR="${XDG_DATA_HOME:-$HOME/.local/share}/thumbnailers"
+    UNITDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    install -d "$THUMBDIR" "$UNITDIR"
+
+    sed "s|/usr/libexec/ffmpeg-thumbnailer|$PREFIX|g" \
+        "$SRC/ffmpeg-thumbnailer.thumbnailer" > "$THUMBDIR/ffmpeg-thumbnailer.thumbnailer"
+    echo "installed $THUMBDIR/ffmpeg-thumbnailer.thumbnailer"
+
+    NVFLAG=""
+    if [ -e /dev/nvidiactl ] || [ -e /dev/nvidia0 ]; then
+        NVFLAG="--nv"
+        echo "NVIDIA device detected; service will run with --nv"
+    fi
+
+    APPTAINER_BIN="$(command -v apptainer 2>/dev/null || echo /usr/bin/apptainer)"
+    sed -e "s|@APPTAINER@|$APPTAINER_BIN|g" \
+        -e "s|@NVFLAG@|$NVFLAG|g" \
+        -e "s|@SIF@|$SIF|g" \
+        "$SRC/ffmpeg-thumbnailer.service" > "$UNITDIR/ffmpeg-thumbnailer.service"
+    echo "installed $UNITDIR/ffmpeg-thumbnailer.service"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload || true
+        systemctl --user enable --now ffmpeg-thumbnailer.service || true
+        echo "enabled ffmpeg-thumbnailer.service"
+    fi
+
+    echo
+    echo "Done. Verify with: apptainer run --app verify $SIF"
+
+# ---------------------------------------------------------------- uninstall
+
+%apphelp uninstall
+    Remove everything the install app placed.
+
+%apprun uninstall
+    set -u
+    PREFIX="${FFT_PREFIX:-/usr/libexec/ffmpeg-thumbnailer}"
+    THUMBDIR="${XDG_DATA_HOME:-$HOME/.local/share}/thumbnailers"
+    UNITDIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now ffmpeg-thumbnailer.service 2>/dev/null || true
+    fi
+    rm -f "$UNITDIR/ffmpeg-thumbnailer.service" \
+          "$THUMBDIR/ffmpeg-thumbnailer.thumbnailer" \
+          "$PREFIX/ffmpeg-video-thumbnailer-shim"
+    rmdir "$PREFIX" 2>/dev/null || true
+    command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload || true
+    echo "removed shim, thumbnailer entry and user service"
+
+# ---------------------------------------------------------------- thumbnail
+
+%apphelp thumbnail
+    Make a single thumbnail directly, bypassing the daemon: thumbnail [-s SIZE] IN OUT
+
+%apprun thumbnail
+    set -eu
+    SIZE=256
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s|--size) SIZE="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [ $# -eq 2 ] || { echo "usage: thumbnail [-s SIZE] IN OUT" >&2; exit 1; }
+    vf="scale=min(${SIZE}\,iw):min(${SIZE}\,ih):force_original_aspect_ratio=decrease"
+    for seek in 00:00:03 00:00:00; do
+        if ffmpeg -y -loglevel error -ss "$seek" -i "$1" -vf "$vf" \
+                  -vframes 1 -update 1 "$2" 2>/dev/null && [ -s "$2" ]; then
+            exit 0
+        fi
+    done
+    echo "thumbnail: ffmpeg produced no frame from $1" >&2
+    exit 1
+
+# ---------------------------------------------------------------- fix
+
+%apphelp fix
+    Regenerate thumbnails GNOME recorded in its fail cache and purge the markers.
+
+%apprun fix
+    exec python3 /opt/ffmpeg-thumbnailer/fix-failed-thumbnails.py "$@"
+
+# ---------------------------------------------------------------- encode
+
+%apphelp encode
+    Hardware-accelerated transcode: encode [-c h264|hevc|av1] [-q QUALITY] IN OUT
+    Picks NVENC on NVIDIA, VA-API on AMD and Intel, and falls back to libx264/libx265/
+    SVT-AV1 in software when no usable GPU is present.
+
+%apprun encode
+    set -eu
+    CODEC=h264
+    QUALITY=23
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -c|--codec)   CODEC="$2"; shift 2 ;;
+            -q|--quality) QUALITY="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [ $# -eq 2 ] || { echo "usage: encode [-c h264|hevc|av1] [-q Q] IN OUT" >&2; exit 1; }
+    IN="$1"; OUT="$2"
+
+    RENDER=""
+    for d in /dev/dri/renderD*; do
+        if [ -e "$d" ] && vainfo --display drm --device "$d" >/dev/null 2>&1; then
+            RENDER="$d"
+            break
+        fi
+    done
+
+    if [ -e /dev/nvidiactl ] && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "${CODEC}_nvenc"; then
+        echo "encode: ${CODEC}_nvenc on NVIDIA" >&2
+        exec ffmpeg -y -hwaccel cuda -i "$IN" -c:v "${CODEC}_nvenc" -cq "$QUALITY" -c:a copy "$OUT"
+    fi
+
+    if [ -n "$RENDER" ] && ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "${CODEC}_vaapi"; then
+        echo "encode: ${CODEC}_vaapi on $RENDER" >&2
+        exec ffmpeg -y -vaapi_device "$RENDER" -i "$IN" \
+             -vf 'format=nv12,hwupload' -c:v "${CODEC}_vaapi" -qp "$QUALITY" -c:a copy "$OUT"
+    fi
+
+    case "$CODEC" in
+        h264) SW=libx264 ;;
+        hevc) SW=libx265 ;;
+        av1)  SW=libsvtav1 ;;
+        *)    echo "encode: unknown codec $CODEC" >&2; exit 1 ;;
+    esac
+    echo "encode: no usable GPU encoder, falling back to $SW" >&2
+    exec ffmpeg -y -i "$IN" -c:v "$SW" -crf "$QUALITY" -c:a copy "$OUT"
+
+# ---------------------------------------------------------------- ffmpeg
+
+%apphelp ffmpeg
+    Raw ffmpeg with every codec and hwaccel this image was built with.
+
+%apprun ffmpeg
+    exec ffmpeg "$@"
+
+# ---------------------------------------------------------------- verify
+
+%apphelp verify
+    End-to-end check: daemon reachable, thumbnails generated, and the shim working
+    under a faithful reconstruction of GNOME's thumbnail sandbox.
+
+%apprun verify
+    exec /bin/sh /opt/ffmpeg-thumbnailer/verify.sh "$@"

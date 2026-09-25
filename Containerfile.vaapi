@@ -1,0 +1,31 @@
+# ffmpeg-thumbnailer runtime, AMD / Intel variant.
+#
+# Base: jrottenberg/ffmpeg 9.0-vaapi2404 -- VA-API enabled, no CUDA. Covers AMD (Mesa
+# radeonsi) and Intel (iHD / i965). A third the size of the NVIDIA variant; use this one
+# on any machine without an NVIDIA GPU.
+#
+# Upstream's runtime stage copies only /usr/local out of its builder, so the published
+# image ships libva but no VA drivers, and no python3. Both are added here; nothing is
+# rebuilt.
+FROM docker.io/jrottenberg/ffmpeg:9.0-vaapi2404
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get -yqq update \
+ && apt-get install -yq --no-install-recommends \
+      mesa-va-drivers \
+      intel-media-va-driver \
+      i965-va-driver \
+      libva-drm2 \
+      vainfo \
+      python3-minimal \
+      python3-pil \
+ && rm -rf /var/lib/apt/lists/*
+
+# libva must find the distro VA drivers; ffmpeg's own libva lives in /usr/local/lib.
+ENV LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+
+COPY thumbnailer-server.py /usr/libexec/ffmpeg-thumbnailer/thumbnailer-server.py
+RUN chmod +x /usr/libexec/ffmpeg-thumbnailer/thumbnailer-server.py
+
+ENTRYPOINT ["/usr/libexec/ffmpeg-thumbnailer/thumbnailer-server.py"]

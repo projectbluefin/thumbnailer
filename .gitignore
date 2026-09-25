@@ -1,0 +1,4 @@
+*.sif
+*.oci
+__pycache__/
+*.pyc

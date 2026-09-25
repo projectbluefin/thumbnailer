@@ -1,0 +1,23 @@
+[Unit]
+Description=FFmpeg Video Thumbnailer Daemon (Apptainer)
+Documentation=https://github.com/projectbluefin/ffmpeg-thumbnailer
+After=graphical-session.target
+
+[Service]
+Type=simple
+# @APPTAINER@, @NVFLAG@ and @SIF@ are stamped in by `apptainer run --app install`.
+# $HOME, /tmp, /var/tmp and /dev/dri are bound by apptainer's defaults; /run/media and
+# /mnt are not, and removable media lives there. The socket goes under $HOME/.cache,
+# because that is the only writable path GNOME's thumbnail sandbox binds through.
+ExecStart=@APPTAINER@ run @NVFLAG@ \
+    --bind /run/media \
+    --bind /mnt \
+    @SIF@
+Restart=always
+RestartSec=3s
+# A decode loop should never contend with the desktop.
+Nice=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=graphical-session.target default.target

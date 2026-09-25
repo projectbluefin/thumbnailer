@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ffmpeg-thumbnailer-verify -- host-side verification.
+#
+# The interesting failure mode is not "does ffmpeg work", it is "does the shim work
+# under the sandbox GNOME actually builds". So this reproduces the bind set from
+# add_bwrap() in gnome-desktop-thumbnail-script.c exactly:
+#
+#   --ro-bind /usr /usr, usr-merged dirs symlinked or ro-bound,
+#   --ro-bind-try /etc/ld.so.cache, /etc/alternatives, fontconfig cache,
+#   --bind <gst cache dir> <gst cache dir>          (the only writable host path)
+#   --proc /proc --dev /dev --chdir / --unshare-all --die-with-parent
+#   --bind <outdir> /tmp
+#   --ro-bind <infile> /tmp/<basename>
+#
+# Notably absent: $HOME and $XDG_RUNTIME_DIR. A socket under either is invisible in
+# there, which is why the daemon puts it in the GStreamer cache directory.
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; NC='\033[0m'
+fail=0
+ok()   { printf "${GREEN}  ok${NC}   %s\n" "$1"; }
+bad()  { printf "${RED}  FAIL${NC} %s\n" "$1"; fail=1; }
+warn() { printf "${YELLOW}  warn${NC} %s\n" "$1"; }
+head_() { printf "${BLUE}== %s${NC}\n" "$1"; }
+
+SHIM="${FFT_SHIM:-/usr/libexec/ffmpeg-thumbnailer/ffmpeg-video-thumbnailer-shim}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+GST_CACHE_DIR="$CACHE_HOME/gnome-desktop-thumbnailer/gstreamer-1.0"
+SOCK="${FFT_SOCKET:-$GST_CACHE_DIR/ffmpeg-thumbnailer.sock}"
+
+head_ "runtime prerequisites"
+if command -v squashfuse >/dev/null 2>&1 || command -v squashfuse_ll >/dev/null 2>&1; then
+    ok "squashfuse present; apptainer mounts the SIF instead of extracting it"
+else
+    bad "squashfuse missing: every daemon start will extract the whole image into \$APPTAINER_TMPDIR"
+fi
+
+head_ "service"
+if systemctl --user is-active ffmpeg-thumbnailer.service >/dev/null 2>&1; then
+    ok "ffmpeg-thumbnailer.service active"
+else
+    bad "ffmpeg-thumbnailer.service not active"
+    systemctl --user --no-pager status ffmpeg-thumbnailer.service 2>&1 | sed 's/^/       /' | head -12
+fi
+
+head_ "socket placement"
+if [ -S "$SOCK" ]; then
+    ok "socket present at $SOCK"
+    case "$SOCK" in
+        "$GST_CACHE_DIR"/*) ok "socket is inside the directory GNOME binds into the sandbox" ;;
+        *) bad "socket is outside the GStreamer cache dir; the sandbox cannot reach it" ;;
+    esac
+else
+    bad "no socket at $SOCK"
+fi
+
+head_ "shim placement"
+if [ -x "$SHIM" ]; then
+    ok "shim at $SHIM"
+    case "$SHIM" in
+        /usr/*) ok "shim is under /usr, which the sandbox ro-binds" ;;
+        *) bad "shim is outside /usr; GNOME's sandbox will not see it" ;;
+    esac
+else
+    bad "shim not found or not executable at $SHIM"
+fi
+
+head_ "thumbnailer entry"
+ENTRY=""
+for d in "${XDG_DATA_HOME:-$HOME/.local/share}/thumbnailers" /usr/share/thumbnailers; do
+    if [ -f "$d/ffmpeg-thumbnailer.thumbnailer" ]; then
+        ENTRY="$d/ffmpeg-thumbnailer.thumbnailer"
+        break
+    fi
+done
+if [ -n "$ENTRY" ]; then
+    ok "entry at $ENTRY"
+    entry_exec=$(sed -n 's/^TryExec=//p' "$ENTRY")
+    [ -x "$entry_exec" ] && ok "TryExec resolves: $entry_exec" \
+                         || bad "TryExec does not resolve: $entry_exec"
+    if [ -f /usr/share/thumbnailers/gst-video-thumbnailer.thumbnailer ] \
+       && [ "${ENTRY#"${XDG_DATA_HOME:-$HOME/.local/share}"}" != "$ENTRY" ]; then
+        ok "user entry shadows the system gst-video-thumbnailer entry"
+    fi
+else
+    bad "no ffmpeg-thumbnailer.thumbnailer installed"
+fi
+
+head_ "end-to-end inside GNOME's sandbox"
+if ! command -v bwrap >/dev/null 2>&1; then
+    warn "bwrap not found; skipping the sandbox test"
+else
+    OUTDIR=$(mktemp -d /tmp/gnome-desktop-thumbnailer-XXXXXX)
+    SRCDIR=$(mktemp -d)
+    trap 'rm -rf "$OUTDIR" "$SRCDIR"' EXIT
+    # mpeg4, not libx264: distributions that ship ffmpeg-free have no x264 encoder.
+    if ! ffmpeg -y -loglevel error -f lavfi \
+                -i testsrc=duration=5:size=1280x720:rate=30 \
+                -c:v mpeg4 -q:v 3 "$SRCDIR/sample.mp4" 2>/dev/null; then
+        warn "host ffmpeg could not build a sample clip; skipping the sandbox test"
+    fi
+
+    if [ -f "$SRCDIR/sample.mp4" ]; then
+        bwrap_args=(
+            --ro-bind /usr /usr
+            --ro-bind-try /etc/ld.so.cache /etc/ld.so.cache
+            --ro-bind-try /etc/alternatives /etc/alternatives
+        )
+        for d in bin lib64 lib sbin; do
+            [ -e "/$d" ] || continue
+            if [ -L "/$d" ]; then
+                bwrap_args+=(--symlink "/usr/$d" "/$d")
+            else
+                bwrap_args+=(--ro-bind "/$d" "/$d")
+            fi
+        done
+        mkdir -p "$GST_CACHE_DIR"
+        bwrap_args+=(
+            --bind "$GST_CACHE_DIR" "$GST_CACHE_DIR"
+            --proc /proc --dev /dev --chdir /
+            --setenv GIO_USE_VFS local
+            --unshare-all --die-with-parent
+            --bind "$OUTDIR" /tmp
+            --ro-bind "$SRCDIR/sample.mp4" /tmp/sample.mp4
+        )
+
+        if bwrap "${bwrap_args[@]}" "$SHIM" -s 256 /tmp/sample.mp4 /tmp/out.png 2>"$OUTDIR/err"; then
+            if [ -s "$OUTDIR/out.png" ] && file "$OUTDIR/out.png" | grep -qi 'PNG image'; then
+                ok "shim produced $(file -b "$OUTDIR/out.png" | cut -d, -f1,2)"
+            else
+                bad "shim exited 0 but produced no valid PNG"
+            fi
+        else
+            bad "shim failed inside the sandbox"
+            sed 's/^/       /' "$OUTDIR/err" | head -6
+        fi
+    fi
+fi
+
+head_ "thumbnail cache"
+CACHE_DIR="$CACHE_HOME/thumbnails"
+if [ -d "$CACHE_DIR" ]; then
+    ok "$CACHE_DIR exists ($(find "$CACHE_DIR" -name '*.png' 2>/dev/null | wc -l) thumbnails)"
+    nfail=$(find "$CACHE_DIR/fail" -name '*.png' 2>/dev/null | wc -l)
+    if [ "$nfail" -gt 0 ]; then
+        warn "$nfail entries in the fail cache; clear them with: apptainer run --app fix <sif>"
+    fi
+else
+    warn "$CACHE_DIR does not exist yet"
+fi
+
+echo
+if [ "$fail" = 0 ]; then
+    printf "${GREEN}host checks passed${NC}\n"
+else
+    printf "${RED}some host checks failed${NC}\n"
+fi
+exit "$fail"

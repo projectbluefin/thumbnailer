@@ -1,0 +1,113 @@
+#!/usr/bin/env sh
+# ffmpeg-video-thumbnailer-shim
+#
+# Runs inside GNOME's thumbnailer sandbox, where no container runtime can start
+# (bwrap --unshare-all plus a seccomp filter denying unshare/mount/CLONE_NEWUSER).
+# Hands the job to the ffmpeg-thumbnailer daemon over a UNIX socket instead.
+#
+# Usage: ffmpeg-video-thumbnailer-shim [-s SIZE] <INPUT> <OUTPUT>
+set -eu
+
+SIZE=256
+INPUT=""
+OUTPUT=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--size)
+            SIZE="${2:-256}"
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            if [ -z "$INPUT" ]; then
+                INPUT="$1"
+            elif [ -z "$OUTPUT" ]; then
+                OUTPUT="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$INPUT" ] || [ -z "$OUTPUT" ]; then
+    echo "Usage: $0 [-s SIZE] <INPUT> <OUTPUT>" >&2
+    exit 1
+fi
+
+# GNOME passes a URI for %u; the daemon wants a path.
+case "$INPUT" in
+    file://*)
+        INPUT="$(printf '%s' "${INPUT#file://}" | python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.unquote(sys.stdin.read()))' 2>/dev/null || printf '%s' "${INPUT#file://}")"
+        ;;
+esac
+
+# GNOME's sandbox binds neither $HOME nor $XDG_RUNTIME_DIR, but it does bind the
+# GStreamer plugin cache directory read-write at its real host path. That is where
+# the daemon puts the socket. The other candidates cover unsandboxed use: manual
+# runs, the verify app, and desktops that do not sandbox thumbnailers.
+CACHE_HOME="${XDG_CACHE_HOME:-${HOME:-/nonexistent}/.cache}"
+SOCK_PATH=""
+for candidate in \
+    "${FFT_SOCKET:-}" \
+    "${CACHE_HOME}/gnome-desktop-thumbnailer/gstreamer-1.0/ffmpeg-thumbnailer.sock" \
+    "${XDG_RUNTIME_DIR:-}/ffmpeg-thumbnailer.sock" \
+    "/run/user/$(id -u)/ffmpeg-thumbnailer.sock"
+do
+    [ -n "$candidate" ] || continue
+    if [ -S "$candidate" ]; then
+        SOCK_PATH="$candidate"
+        break
+    fi
+done
+
+outdir="$(dirname "$OUTPUT")"
+[ -d "$outdir" ] || mkdir -p "$outdir" 2>/dev/null || true
+
+if [ -n "$SOCK_PATH" ]; then
+    # Paths visible in here are sandbox-internal and meaningless to the daemon,
+    # which lives outside this mount namespace. Send open descriptors instead.
+    RESP="$(python3 -c '
+import os, socket, sys
+
+sock_path, size, in_path, out_path = sys.argv[1:5]
+in_fd = out_fd = None
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(90.0)
+try:
+    in_fd = os.open(in_path, os.O_RDONLY)
+    out_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    sock.connect(sock_path)
+    socket.send_fds(sock, [f"THUMB\t{size}\n".encode()], [in_fd, out_fd])
+    sys.stdout.write(sock.recv(4096).decode("utf-8", errors="replace").strip())
+except Exception:
+    sys.exit(1)
+finally:
+    for fd in (in_fd, out_fd):
+        if fd is not None:
+            os.close(fd)
+    sock.close()
+' "$SOCK_PATH" "$SIZE" "$INPUT" "$OUTPUT" 2>/dev/null || true)"
+
+    if [ "$RESP" = "OK" ] && [ -s "$OUTPUT" ]; then
+        exit 0
+    fi
+    echo "ffmpeg-thumbnailer: daemon said '${RESP:-<no response>}'" >&2
+fi
+
+# Daemon unreachable or failed. Try host ffmpeg if the sandbox exposes one.
+if command -v ffmpeg >/dev/null 2>&1; then
+    vf="scale=min(${SIZE}\,iw):min(${SIZE}\,ih):force_original_aspect_ratio=decrease"
+    for seek in 00:00:03 00:00:00; do
+        if ffmpeg -y -loglevel error -ss "$seek" -i "$INPUT" \
+                  -vf "$vf" -vframes 1 -update 1 "$OUTPUT" 2>/dev/null \
+           && [ -s "$OUTPUT" ]; then
+            exit 0
+        fi
+    done
+fi
+
+echo "ffmpeg-thumbnailer: no thumbnail produced for $INPUT" >&2
+exit 1
