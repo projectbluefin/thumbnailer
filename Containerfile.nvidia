@@ -7,7 +7,7 @@
 # Upstream's runtime stage copies only /usr/local out of its builder, so the published
 # image ships libva but no VA drivers, and no python3. Both are added here; nothing is
 # rebuilt.
-FROM docker.io/jrottenberg/ffmpeg:9.0-nvidia2404@sha256:ae58a369eb86f9ee2fe9e49ebde781ae5e6556349bf45f9c610a4f057d256d72
+FROM docker.io/jrottenberg/ffmpeg:9.0-nvidia2404@sha256:d282821f721b81d3db54d3272e66789f555a04f6a7f7a72c46bc7f5d23b0a4f2
 
 ARG DEBIAN_FRONTEND=noninteractive
 
